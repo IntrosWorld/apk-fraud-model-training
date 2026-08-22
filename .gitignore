@@ -7,5 +7,5 @@ outputs/
 data/*.csv
 data/*.jsonl
 data/*.parquet
+data/*.metadata.json
 !data/README.md
-
