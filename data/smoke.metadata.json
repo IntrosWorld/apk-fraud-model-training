@@ -1,0 +1,13 @@
+{
+  "created_at_epoch": 1787419686,
+  "rows": 2,
+  "class_counts": {
+    "benign": 1,
+    "banking": 1
+  },
+  "seed": 2020,
+  "benign_skip": 20,
+  "static_only": true,
+  "contains_apk_bytes": false,
+  "contains_raw_iocs": false
+}

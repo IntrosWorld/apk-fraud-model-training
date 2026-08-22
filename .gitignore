@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.joblib
+*.pkl
+outputs/
+data/*.csv
+data/*.jsonl
+data/*.parquet
+!data/README.md
+
