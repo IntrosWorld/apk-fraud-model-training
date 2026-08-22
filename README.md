@@ -29,15 +29,16 @@ python build_dataset.py `
   --backend-root "F:\College\Hackathon\iit_hyd\backend" `
   --banking-dir "F:\College\Hackathon\iit_hyd\test\Banking" `
   --benign-archive "F:\College\Hackathon\iit_hyd\test\a\Benign.tar.gz" `
-  --samples-per-class 50 `
+  --samples-per-class 500 `
   --benign-skip 20 `
+  --workers 4 `
   --output data\apk_static_features.csv
 ```
 
-The exporter is static-only. Benign APKs are streamed into a temporary file one at a
-time, hash-verified, analyzed, and deleted. JSONL checkpointing makes interrupted runs
-resumable. The first 20 benign members are skipped because they were already used for
-rule calibration.
+The exporter is static-only. Benign APKs are streamed into bounded temporary batches,
+hash-verified, analyzed by isolated workers, and deleted. Content-hash deduplication and
+JSONL checkpointing make interrupted runs resumable. The first 20 benign members are
+skipped because they were already used for rule calibration.
 
 ## Leakage controls
 

@@ -18,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 
@@ -151,6 +152,44 @@ def _read_checkpoint(path: Path) -> list[dict]:
     return rows
 
 
+def _deduplicate_rows(rows: list[dict]) -> list[dict]:
+    """Preserve the first complete row for each computed APK content hash."""
+    unique = []
+    seen = set()
+    for row in rows:
+        sha256 = str(row.get("sha256") or "").lower()
+        if not sha256 or sha256 in seen:
+            continue
+        seen.add(sha256)
+        unique.append(row)
+    return unique
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _analyse_worker(task: tuple[str, str]) -> dict:
+    """Run one static analysis in an isolated worker process."""
+    backend_root, apk_path = task
+    if backend_root not in sys.path:
+        sys.path.insert(0, backend_root)
+    try:
+        from loguru import logger
+        logger.remove()
+    except Exception:
+        pass
+    try:
+        from app.analyzer.static_analyzer import analyze
+        return analyze(apk_path)
+    except Exception as exc:
+        return {"valid_apk": False, "errors": [f"worker failure: {exc}"]}
+
+
 def _valid_benign_member(member: tarfile.TarInfo) -> str | None:
     if not member.isfile() or member.size <= 0 or member.size > 100 * 1024 * 1024:
         return None
@@ -165,22 +204,61 @@ def _analyse_banking(analyze, directory: Path, wanted: int, seed: int, done: set
     random.Random(seed).shuffle(candidates)
     completed = 0
     for path in candidates:
-        sha = path.stem.lower()
+        source_name = path.stem.lower()
+        # Some extracted CIC archive filenames do not equal the current file-content
+        # hash. Deduplicate on computed content identity, never the source filename.
+        sha = _sha256_file(path)
         if sha in done:
             continue
         result = analyze(str(path))
         if result.get("valid_apk"):
-            _write_checkpoint(checkpoint, feature_row(result, label=1, family="Banking", source="CICMalDroid-2020"))
+            row = feature_row(result, label=1, family="Banking", source="CICMalDroid-2020")
+            row["source_member"] = source_name
+            _write_checkpoint(checkpoint, row)
+            done.add(str(row["sha256"]))
             completed += 1
-            print(f"Banking {completed}/{wanted}: {sha}", flush=True)
+            print(f"Banking {completed}/{wanted}: {source_name}", flush=True)
         if completed >= wanted:
             break
 
 
-def _analyse_benign(analyze, archive: Path, wanted: int, skip: int, done: set[str], checkpoint: Path) -> None:
+def _analyse_benign(
+    archive: Path,
+    wanted: int,
+    skip: int,
+    done: set[str],
+    checkpoint: Path,
+    backend_root: Path,
+    workers: int,
+) -> None:
     completed = 0
     eligible = 0
-    with tempfile.TemporaryDirectory(prefix="maldroid-benign-") as temporary, tarfile.open(archive, "r|gz") as tar:
+    batch = []
+
+    def process_batch(pool) -> None:
+        nonlocal completed
+        if not batch:
+            return
+        tasks = [(str(backend_root), str(item["path"])) for item in batch]
+        results = list(pool.map(_analyse_worker, tasks))
+        for item, result in zip(batch, results):
+            try:
+                if result.get("valid_apk"):
+                    row = feature_row(result, label=0, family="Benign", source="CICMalDroid-2020")
+                    row["source_member"] = item["sha"]
+                    _write_checkpoint(checkpoint, row)
+                    done.add(str(row["sha256"]))
+                    completed += 1
+                    print(f"Benign {completed}/{wanted}: {item['sha']}", flush=True)
+            finally:
+                item["path"].unlink(missing_ok=True)
+        batch.clear()
+
+    with (
+        tempfile.TemporaryDirectory(prefix="maldroid-benign-") as temporary,
+        tarfile.open(archive, "r|gz") as tar,
+        ProcessPoolExecutor(max_workers=max(1, workers)) as pool,
+    ):
         root = Path(temporary)
         for member in tar:
             filename = _valid_benign_member(member)
@@ -206,26 +284,23 @@ def _analyse_benign(analyze, archive: Path, wanted: int, skip: int, done: set[st
             if digest.hexdigest() != sha:
                 path.unlink(missing_ok=True)
                 continue
-            try:
-                result = analyze(str(path))
-                if result.get("valid_apk"):
-                    _write_checkpoint(checkpoint, feature_row(result, label=0, family="Benign", source="CICMalDroid-2020"))
-                    completed += 1
-                    print(f"Benign {completed}/{wanted}: {sha}", flush=True)
-            finally:
-                path.unlink(missing_ok=True)
+            batch.append({"path": path, "sha": sha})
+            target_batch_size = min(max(1, workers * 2), wanted - completed)
+            if len(batch) >= target_batch_size:
+                process_batch(pool)
             if completed >= wanted:
                 break
+        process_batch(pool)
 
 
 def _write_csv(rows: list[dict], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0])
+    fieldnames = list(rows[0]) + sorted(set().union(*(row.keys() for row in rows)) - set(rows[0]))
     with output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            encoded = dict(row)
+            encoded = {column: row.get(column, "") for column in fieldnames}
             for column in LIST_COLUMNS:
                 encoded[column] = json.dumps(encoded.get(column) or [], separators=(",", ":"))
             writer.writerow(encoded)
@@ -239,6 +314,7 @@ def main() -> int:
     parser.add_argument("--samples-per-class", type=int, default=100)
     parser.add_argument("--benign-skip", type=int, default=20, help="exclude the rule-calibration slice")
     parser.add_argument("--seed", type=int, default=2020)
+    parser.add_argument("--workers", type=int, default=4, help="parallel static-analysis workers")
     parser.add_argument("--output", type=Path, default=Path("data/apk_static_features.csv"))
     args = parser.parse_args()
 
@@ -253,18 +329,27 @@ def main() -> int:
 
     checkpoint = args.output.with_suffix(".jsonl")
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_checkpoint(checkpoint)
+    existing = _deduplicate_rows(_read_checkpoint(checkpoint))
     done = {str(row.get("sha256")) for row in existing}
     by_label = {label: sum(int(row.get("label", -1)) == label for row in existing) for label in (0, 1)}
     banking_needed = max(0, args.samples_per_class - by_label[1])
     benign_needed = max(0, args.samples_per_class - by_label[0])
     if banking_needed:
         _analyse_banking(analyze, args.banking_dir, banking_needed, args.seed, done, checkpoint)
-    existing = _read_checkpoint(checkpoint)
+    existing = _deduplicate_rows(_read_checkpoint(checkpoint))
     done = {str(row.get("sha256")) for row in existing}
     if benign_needed:
-        _analyse_benign(analyze, args.benign_archive, benign_needed, args.benign_skip, done, checkpoint)
-    checkpoint_rows = _read_checkpoint(checkpoint)
+        _analyse_benign(
+            args.benign_archive,
+            benign_needed,
+            args.benign_skip,
+            done,
+            checkpoint,
+            backend_root,
+            args.workers,
+        )
+    raw_checkpoint_rows = _read_checkpoint(checkpoint)
+    checkpoint_rows = _deduplicate_rows(raw_checkpoint_rows)
     if not checkpoint_rows:
         raise RuntimeError("No valid APK features were generated")
     # A resumed checkpoint may contain more rows from one class. Publish an exactly
@@ -285,6 +370,7 @@ def main() -> int:
         "static_only": True,
         "contains_apk_bytes": False,
         "contains_raw_iocs": False,
+        "duplicate_checkpoint_rows_discarded": len(raw_checkpoint_rows) - len(checkpoint_rows),
     }
     args.output.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2))

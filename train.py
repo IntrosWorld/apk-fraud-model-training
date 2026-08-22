@@ -24,7 +24,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedGroupKFold
 
 
-IDENTITY_COLUMNS = {"sha256", "label", "family", "group_id", "source", "analysis_quality"}
+IDENTITY_COLUMNS = {"sha256", "label", "family", "group_id", "source", "source_member", "analysis_quality"}
 LIST_COLUMNS = {
     "permissions": "perm",
     "dangerous_permissions": "dangerous_perm",
